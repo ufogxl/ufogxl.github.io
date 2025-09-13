@@ -4,10 +4,11 @@ url: "https://ufogxl.github.io"
 baseurl: ""
 
 # Chirpy 主题
-remote_theme: "cotes2020/jekyll-theme-chirpy"
+theme: jekyll-theme-chirpy # 改为本地主题，与 Gemfile 一致
 
 # 时区设置
 timezone: Asia/Shanghai
+lang: en
 
 # Jekyll 配置
 markdown: kramdown
@@ -20,17 +21,31 @@ plugins:
   - jekyll-sitemap
   - jekyll-paginate
   - jekyll-seo-tag
-  - jekyll-include-cache # 新增：支持 mermaid include
+  - jekyll-include-cache
 
 # 分页
 paginate: 10
 
-# Kramdown 配置（新增：支持更好的代码渲染）
+# Kramdown 配置（支持 mermaid）
 kramdown:
   input: GFM
   syntax_highlighter: rouge
+  footnote_backlink: "&#8617;&#xfe0e;"
+  syntax_highlighter_opts:
+    css_class: highlight
+    span:
+      line_numbers: false
+    block:
+      line_numbers: true
+      start_line: 1
 
-# 默认设置
+# Collections
+collections:
+  tabs:
+    output: true
+    sort_by: order
+
+# 默认设置（关键：启用 mermaid）
 defaults:
   - scope:
       path: ""
@@ -39,18 +54,69 @@ defaults:
       layout: post
       toc: true
       comments: false
-      mermaid: true
+      mermaid: true # 所有文章默认启用 mermaid
+  - scope:
+      path: _drafts
+    values:
+      comments: false
+  - scope:
+      path: ""
+      type: tabs
+    values:
+      layout: page
+      permalink: /:title/
 
-# 社交链接（可选）
+# 社交链接
 social:
   name: ufogxl
   email: your-email@example.com
   links:
     - https://github.com/ufogxl
 
-# Google Analytics（可选）
-# google_analytics:
-#   id: 'G-XXXXXXXXXX'
+github:
+  username: ufogxl
 
 # 主题设置
 theme_mode: # 留空表示跟随系统
+toc: true
+
+# PWA
+pwa:
+  enabled: true
+  cache:
+    enabled: true
+
+# 压缩设置
+sass:
+  style: compressed
+
+compress_html:
+  clippings: all
+  comments: all
+  endings: all
+  profile: false
+  blanklines: false
+  ignore:
+    envs: [development]
+
+# 排除文件
+exclude:
+  - "*.gem"
+  - "*.gemspec"
+  - docs
+  - tools
+  - README.md
+  - LICENSE
+  - purgecss.js
+  - "*.config.js"
+  - "package*.json"
+
+# Jekyll Archives
+jekyll-archives:
+  enabled: [categories, tags]
+  layouts:
+    category: category
+    tag: tag
+  permalinks:
+    tag: /tags/:name/
+    category: /categories/:name/
