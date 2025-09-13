@@ -20,9 +20,15 @@ plugins:
   - jekyll-sitemap
   - jekyll-paginate
   - jekyll-seo-tag
+  - jekyll-include-cache # 新增：支持 mermaid include
 
 # 分页
 paginate: 10
+
+# Kramdown 配置（新增：支持更好的代码渲染）
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
 
 # 默认设置
 defaults:

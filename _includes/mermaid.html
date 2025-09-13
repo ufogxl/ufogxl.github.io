@@ -1,0 +1,30 @@
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  document.addEventListener("DOMContentLoaded", function () {
+    // 转换代码块为 mermaid div
+    const mermaidBlocks = document.querySelectorAll(
+      "pre code.language-mermaid"
+    );
+    mermaidBlocks.forEach(function (block) {
+      const pre = block.parentElement;
+      const mermaidDiv = document.createElement("div");
+      mermaidDiv.className = "mermaid";
+      mermaidDiv.innerHTML = block.innerHTML
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&amp;/g, "&");
+      pre.parentNode.replaceWith(mermaidDiv);
+    });
+
+    // 初始化 mermaid
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "default",
+      securityLevel: "loose",
+      flowchart: {
+        useMaxWidth: true,
+        htmlLabels: true,
+      },
+    });
+  });
+</script>
