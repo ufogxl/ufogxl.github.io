@@ -1,23 +1,29 @@
 title: "技术博客"
 description: "分享技术学习笔记"
 url: "https://ufogxl.github.io"
+baseurl: ""
 
-remote_theme: cotes2020/jekyll-theme-chirpy
+# 使用 GitHub Pages 原生支持的主题
+theme: minima
 
+# Jekyll 配置
 markdown: kramdown
-permalink: /:categories/:title/
+highlighter: rouge
+permalink: /:year/:month/:day/:title/
 
+# 插件
 plugins:
   - jekyll-feed
   - jekyll-sitemap
-  - jekyll-include-cache
 
+# 默认设置
 defaults:
   - scope:
       path: ""
       type: posts
     values:
       layout: post
-      toc: true
-      mermaid: true
-      math: true
+      show_excerpts: true
+
+# 网站设置
+show_excerpts: true
