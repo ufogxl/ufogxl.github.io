@@ -1,6 +1,9 @@
 ---
 title: "Apple平台内核级workqueue机制：完整技术解析"
 date: 2025-09-13
+categories: [技术, 内核]
+tags: [apple, workqueue, 内核]
+mermaid: true  # 确保这一行存在
 ---
 
 # Apple平台内核级workqueue机制：完整技术解析
