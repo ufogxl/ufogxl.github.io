@@ -1,29 +1,30 @@
 title: "技术博客"
 description: "分享技术学习笔记"
 url: "https://ufogxl.github.io"
-author: "ufogxl"
+baseurl: ""
 
-# 使用 YAT 主题
-remote_theme: "jeffreytse/jekyll-theme-yat"
+# Chirpy 主题
+remote_theme: "cotes2020/jekyll-theme-chirpy"
 
-# YAT 主题配置
-yat:
-  date_format: "%Y年%m月%d日"
-  disqus:
-    shortname: "" # 评论系统，可选
-  google_analytics: "" # 可选
+# 时区设置
+timezone: Asia/Shanghai
 
-# 夜间模式
-night_mode: "auto"
-
-# Jekyll 基础配置
+# Jekyll 配置
 markdown: kramdown
+highlighter: rouge
+permalink: /posts/:title/
+
+# 插件（GitHub Pages 兼容）
 plugins:
   - jekyll-feed
   - jekyll-sitemap
-  - jekyll-spaceship  # 这个插件提供 Mermaid 支持
+  - jekyll-paginate
+  - jekyll-seo-tag
 
-# 默认配置
+# 分页
+paginate: 10
+
+# 默认设置
 defaults:
   - scope:
       path: ""
@@ -31,3 +32,19 @@ defaults:
     values:
       layout: post
       toc: true
+      comments: false
+      mermaid: true
+
+# 社交链接（可选）
+social:
+  name: ufogxl
+  email: your-email@example.com
+  links:
+    - https://github.com/ufogxl
+
+# Google Analytics（可选）
+# google_analytics:
+#   id: 'G-XXXXXXXXXX'
+
+# 主题设置
+theme_mode: # 留空表示跟随系统
