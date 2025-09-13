@@ -716,32 +716,67 @@ static void
 workq_push_idle_thread(proc_t p, struct workqueue *wq, struct uthread *uth, 
                       uint32_t setup_flags)
 {
-    thread_qos_t qos = workq_pri_for_thread(uth);
-    
-    // 1. 更新QoS bucket的活跃线程计数
-    assert(wq->wq_thscheduled_count[_wq_bucket(qos)] > 0);
-    wq->wq_thscheduled_count[_wq_bucket(qos)]--;
-    
-    // 2. 更新全局统计
-    _wq_thactive_dec(wq, qos);
-    wq->wq_fulfilled++; // 完成任务计数器
-    
-    // 3. 线程状态转换：运行中 -> 空闲池
+    uint64_t now = mach_absolute_time();
+    bool is_creator = (uth == wq->wq_creator);
+
+    // 处理cooperative线程的特殊计数
+    if (workq_thread_is_cooperative(uth)) {
+        thread_qos_t thread_qos = uth->uu_workq_pri.qos_req;
+        _wq_cooperative_queue_scheduled_count_dec(wq, thread_qos);
+    } else if (workq_thread_is_nonovercommit(uth)) {
+        wq->wq_constrained_threads_scheduled--;
+    }
+
+    // 1. 线程状态转换：运行中 -> 空闲
+    uth->uu_workq_flags &= ~(UT_WORKQ_RUNNING | UT_WORKQ_OVERCOMMIT | UT_WORKQ_COOPERATIVE);
     TAILQ_REMOVE(&wq->wq_thrunlist, uth, uu_workq_entry);
-    TAILQ_INSERT_HEAD(&wq->wq_thidlelist, uth, uu_workq_entry);
-    
-    uth->uu_workq_flags &= ~UT_WORKQ_RUNNING;
-    uth->uu_workq_flags |= UT_WORKQ_IDLE;
-    
-    // 4. 更新空闲线程计数，为下次任务分配做准备
-    wq->wq_thidlecount++;
-    
-    // 5. 记录线程进入空闲状态的时间戳（用于后续回收决策）
-    uth->uu_save.uus_workq_park_data.idle_stamp = mach_absolute_time();
-    
-    // 6. 检查是否有等待中的任务请求可以立即满足
-    if (workq_has_pending_requests(wq)) {
-        workq_schedule_immediate_thread_creation(p, wq);
+    wq->wq_threads_scheduled--;
+
+    // 2. 处理creator线程状态
+    if (is_creator) {
+        wq->wq_creator = NULL;
+    }
+
+    // 3. 更新turnstile继承者（用于优先级继承）
+    if (wq->wq_inheritor == get_machthread(uth)) {
+        if (wq->wq_reqcount) {
+            workq_turnstile_update_inheritor(wq, wq, TURNSTILE_INHERITOR_WORKQ);
+        } else {
+            workq_turnstile_update_inheritor(wq, TURNSTILE_INHERITOR_NULL, 0);
+        }
+    }
+
+    // 4. 新线程直接加入等待分配队列
+    if (uth->uu_workq_flags & UT_WORKQ_NEW) {
+        TAILQ_INSERT_TAIL(&wq->wq_thnewlist, uth, uu_workq_entry);
+        wq->wq_thidlecount++;
+        return;
+    }
+
+    // 5. 常规线程：更新QoS bucket计数并加入空闲池
+    if (!is_creator) {
+        _wq_thactive_dec(wq, uth->uu_workq_pri.qos_bucket);
+        wq->wq_thscheduled_count[_wq_bucket(uth->uu_workq_pri.qos_bucket)]--;
+        uth->uu_workq_flags |= UT_WORKQ_IDLE_CLEANUP;
+    }
+
+    // 6. 记录进入空闲状态的时间戳（用于后续回收决策）
+    uth->uu_save.uus_workq_park_data.idle_stamp = now;
+
+    // 7. 智能插入位置：检查是否需要立即回收
+    struct uthread *oldest = workq_oldest_killable_idle_thread(wq);
+    uint16_t cur_idle = wq->wq_thidlecount;
+
+    if (cur_idle >= wq_max_constrained_threads ||
+        (wq->wq_thdying_count == 0 && oldest &&
+         workq_should_kill_idle_thread(wq, oldest, now))) {
+        // 如果空闲线程过多，标记当前线程为即将死亡
+        uth->uu_workq_flags |= UT_WORKQ_DYING;
+        wq->wq_thdying_count++;
+    } else {
+        // 正常情况：加入空闲线程池头部（最近使用优先复用）
+        TAILQ_INSERT_HEAD(&wq->wq_thidlelist, uth, uu_workq_entry);
+        wq->wq_thidlecount++;
     }
 }
 ```
