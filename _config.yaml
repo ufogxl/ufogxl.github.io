@@ -1,32 +1,33 @@
-remote_theme: "mmistakes/minimal-mistakes"
-
 title: "技术博客"
 description: "分享技术学习笔记"
 url: "https://ufogxl.github.io"
+author: "ufogxl"
 
-minimal_mistakes_skin: "default"
+# 使用 YAT 主题
+remote_theme: "jeffreytse/jekyll-theme-yat"
 
+# YAT 主题配置
+yat:
+  date_format: "%Y年%m月%d日"
+  disqus:
+    shortname: "" # 评论系统，可选
+  google_analytics: "" # 可选
+
+# 夜间模式
+night_mode: "auto"
+
+# Jekyll 基础配置
 markdown: kramdown
 plugins:
   - jekyll-feed
   - jekyll-sitemap
-  - jekyll-include-cache
+  - jekyll-spaceship  # 这个插件提供 Mermaid 支持
 
-# 添加 Mermaid 脚本
-head_scripts:
-  - https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js
-
-# 添加初始化脚本
-footer_scripts:
-  - /assets/js/mermaid-init.js
-
+# 默认配置
 defaults:
   - scope:
       path: ""
       type: posts
     values:
-      layout: single
-      author_profile: false
+      layout: post
       toc: true
-      toc_label: "目录"
-      toc_sticky: true
