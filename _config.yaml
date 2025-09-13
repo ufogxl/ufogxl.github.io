@@ -1,21 +1,32 @@
-remote_theme: daattali/beautiful-jekyll
+remote_theme: "mmistakes/minimal-mistakes"
 
 title: "技术博客"
 description: "分享技术学习笔记"
 url: "https://ufogxl.github.io"
 
-# 导航菜单
-navbar-links:
-  首页: ""
-  关于: "about"
-
-# 作者信息
-author: ufogxl
-
-# 启用功能
-share-links-active:
-  twitter: false
-  facebook: false
-  linkedin: false
+minimal_mistakes_skin: "default"
 
 markdown: kramdown
+plugins:
+  - jekyll-feed
+  - jekyll-sitemap
+  - jekyll-include-cache
+
+# 添加 Mermaid 脚本
+head_scripts:
+  - https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js
+
+# 添加初始化脚本
+footer_scripts:
+  - /assets/js/mermaid-init.js
+
+defaults:
+  - scope:
+      path: ""
+      type: posts
+    values:
+      layout: single
+      author_profile: false
+      toc: true
+      toc_label: "目录"
+      toc_sticky: true
