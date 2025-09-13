@@ -1,29 +1,21 @@
+remote_theme: daattali/beautiful-jekyll
+
 title: "技术博客"
 description: "分享技术学习笔记"
 url: "https://ufogxl.github.io"
-baseurl: ""
 
-# 使用 GitHub Pages 原生支持的主题
-theme: minima
+# 导航菜单
+navbar-links:
+  首页: ""
+  关于: "about"
 
-# Jekyll 配置
+# 作者信息
+author: ufogxl
+
+# 启用功能
+share-links-active:
+  twitter: false
+  facebook: false
+  linkedin: false
+
 markdown: kramdown
-highlighter: rouge
-permalink: /:year/:month/:day/:title/
-
-# 插件
-plugins:
-  - jekyll-feed
-  - jekyll-sitemap
-
-# 默认设置
-defaults:
-  - scope:
-      path: ""
-      type: posts
-    values:
-      layout: post
-      show_excerpts: true
-
-# 网站设置
-show_excerpts: true
