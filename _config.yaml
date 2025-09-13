@@ -2,25 +2,22 @@ title: "技术博客"
 description: "分享技术学习笔记"
 url: "https://ufogxl.github.io"
 
+remote_theme: cotes2020/jekyll-theme-chirpy
+
 markdown: kramdown
-theme: minima
+permalink: /:categories/:title/
 
 plugins:
   - jekyll-feed
   - jekyll-sitemap
+  - jekyll-include-cache
 
-permalink: /:year/:month/:day/:title/
-
-# Mermaid 支持
-kramdown:
-  input: GFM
-  syntax_highlighter: rouge
-
-# 自定义头部
-plugins:
-  - jekyll-feed
-  - jekyll-sitemap
-
-# 启用 Mermaid
-mermaid:
-  enabled: true
+defaults:
+  - scope:
+      path: ""
+      type: posts
+    values:
+      layout: post
+      toc: true
+      mermaid: true
+      math: true
