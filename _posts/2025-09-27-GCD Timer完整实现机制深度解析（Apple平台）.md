@@ -120,7 +120,6 @@ static void _dispatch_root_queues_init_once(void *context)
 - `_dispatch_kevent_worker_thread`就是Event Manager的实际入口函数
 - 支持workloop和kevent两种模式
 
-
 ## 完整流程时序图
 
 ```mermaid
@@ -142,7 +141,7 @@ sequenceDiagram
     DS->>DS: _dispatch_timer_config_create() + os_atomic_store2o(dt_pending_config)
     Note right of DS: Timer配置存储，但未激活
 
-    Note over User,CB: Timer激活阶段（关键步骤）
+    Note over User,CB: Timer激活阶段（修正版顺序）
     User->>DS: dispatch_resume() 或 dispatch_activate()
     DS->>DS: _dispatch_lane_resume(activate=true/false)
     DS->>DS: _dispatch_lane_resume_activate()
@@ -150,14 +149,20 @@ sequenceDiagram
     DS->>DS: _dispatch_source_install()
     DS->>DS: _dispatch_unote_register()
     DS->>DS: _dispatch_timer_unote_register()
-    DS->>DS: _dispatch_timer_unote_configure() 应用pending配置
-    DS->>MQ: dx_wakeup(DISPATCH_QUEUE_WAKEUP_MGR)
-    MQ->>MQ: _dispatch_mgr_queue_push()
+    Note right of DS: 6. Timer立即注册到系统，应用pending配置
+    
+    DS->>MQ: dx_wakeup(DISPATCH_QUEUE_WAKEUP_MGR) [如果需要]
+    Note right of MQ: 8. 触发管理队列处理（仅在需要时）
+    
     MQ->>PW: _dispatch_event_loop_poke(DISPATCH_WLH_MANAGER)
+    Note right of PW: 9. 管理队列任务处理
+    
     PW->>EM: 分配Event Manager线程处理管理任务
     EM->>EM: _dispatch_mgr_queue_drain()
     EM->>DS: _dispatch_source_invoke() 
     DS->>TH: _dispatch_timer_unote_arm()
+    Note right of TH: 10. Timer arm到heap和kqueue
+    
     TH->>TH: _dispatch_timer_heap_insert()
     TH->>TH: _dispatch_timers_heap_dirty()
     TH->>KQ: _dispatch_event_loop_timer_program()
@@ -360,60 +365,46 @@ void _dispatch_source_activate(dispatch_source_t ds, bool *allow_resume)
 }
 ```
 
-### 6. Timer安装到系统
+### 6. Timer安装到系统（立即注册）
 
 ```c
 // swift-corelibs-libdispatch - src/source.c
-void _dispatch_source_wakeup(dispatch_source_t ds, dispatch_qos_t qos,
-                             dispatch_wakeup_flags_t flags)
+static void _dispatch_source_install(dispatch_source_t ds, dispatch_wlh_t wlh,
+                                    dispatch_priority_t pri)
 {
-    dispatch_timer_source_refs_t dr = ds->ds_timer_refs;
-    dispatch_queue_wakeup_target_t tq = DISPATCH_QUEUE_WAKEUP_NONE;
+    dispatch_source_refs_t dr = ds->ds_refs;
 
-    if (!ds->ds_is_installed) {
-        // Timer source首次注册需要在管理队列中处理
-        tq = DISPATCH_QUEUE_WAKEUP_MGR;
-    } else if (_dispatch_source_refs_needs_configuration(dr)) {
-        // Timer配置变更也需要在管理队列中处理
-        tq = DISPATCH_QUEUE_WAKEUP_MGR;
-    }
+    dispatch_assert(!ds->ds_is_installed);
+    ds->ds_is_installed = true;
 
-    if (tq) {
-        // 将注册/配置任务推送到管理队列
-        return _dispatch_queue_wakeup(ds, qos, flags, tq);
-    }
-    // 最终会调用_dispatch_source_invoke()
-}
-```
-
-### 4. 管理队列任务处理
-
-```c
-// swift-corelibs-libdispatch - src/queue.c
-void _dispatch_mgr_queue_push(dispatch_lane_t dq, dispatch_object_t dou,
-                              dispatch_qos_t qos)
-{
-    // 推送管理任务到管理队列
-    if (unlikely(_dispatch_queue_push_item(dq, dou))) {
-        dq_state = os_atomic_or2o(dq, dq_state, DISPATCH_QUEUE_DIRTY, release);
-        
-        if (!_dq_state_drain_locked_by_self(dq_state)) {
-            _dispatch_trace_runtime_event(worker_request, &_dispatch_mgr_q, 1);
-            
-            // 关键：触发Event Manager线程处理管理任务
-            _dispatch_event_loop_poke(DISPATCH_WLH_MANAGER, 0, 0);
-        }
+    _dispatch_object_debug(ds, "%s", __func__);
+    
+    // 关键：立即注册Timer到系统
+    if (unlikely(!_dispatch_unote_register(dr, wlh, pri))) {
+        return _dispatch_source_refs_finalize_unregistration(ds);
     }
 }
 ```
 
-### 5. Timer注册到系统
+### 7. Timer注册到系统核心实现
 
 ```c
 // swift-corelibs-libdispatch - src/event/event.c
 bool _dispatch_unote_register(dispatch_unote_t du, dispatch_wlh_t wlh,
                               dispatch_priority_t pri)
 {
+    dispatch_assert(du._du->du_is_timer || !_dispatch_unote_registered(du));
+    dispatch_priority_t masked_pri;
+
+    masked_pri = pri & (DISPATCH_PRIORITY_FLAG_MANAGER |
+            DISPATCH_PRIORITY_FLAG_FALLBACK |
+            DISPATCH_PRIORITY_FLAG_FLOOR |
+            DISPATCH_PRIORITY_FALLBACK_QOS_MASK |
+            DISPATCH_PRIORITY_REQUESTED_MASK);
+
+    dispatch_assert(wlh == DISPATCH_WLH_ANON || masked_pri);
+    du._du->du_priority = pri;
+
     if (du._du->du_is_timer) {
         _dispatch_timer_unote_register(du._dt, wlh, pri);
         return true;
@@ -421,41 +412,33 @@ bool _dispatch_unote_register(dispatch_unote_t du, dispatch_wlh_t wlh,
     // 其他类型source处理...
 }
 
+DISPATCH_NOINLINE
 static void _dispatch_timer_unote_register(dispatch_timer_source_refs_t dt,
-                                          dispatch_wlh_t wlh,
+                                          dispatch_wlh_t wlh, 
                                           dispatch_priority_t pri)
 {
-    // 设置workloop归属关系
-    _dispatch_unote_state_set(dt, wlh, DU_STATE_REGISTERED);
-
+    // 处理background/maintenance QoS Timer的积极合并优化
+    // <rdar://problem/12200216&27342536>
+    if (_dispatch_qos_is_background(_dispatch_priority_qos(pri))) {
+        if (dt->du_timer_flags & DISPATCH_TIMER_STRICT) {
+            _dispatch_ktrace1(DISPATCH_PERF_strict_bg_timer,
+                    _dispatch_source_from_refs(dt));
+        } else {
+            dt->du_timer_flags |= DISPATCH_TIMER_BACKGROUND;
+            dt->du_ident = _dispatch_timer_unote_idx(dt);
+        }
+    }
+    
+    // _dispatch_source_activate()可以为直接附加到workloop的Timer预设wlh
+    if (_dispatch_unote_wlh(dt) != wlh) {
+        dispatch_assert(_dispatch_unote_wlh(dt) == NULL);
+        _dispatch_unote_state_set(dt, DISPATCH_WLH_ANON, 0);
+    }
+    
     // 立即应用pending配置
     if (os_atomic_load2o(dt, dt_pending_config, relaxed)) {
         _dispatch_timer_unote_configure(dt);
     }
-}
-```
-
-```c
-// swift-corelibs-libdispatch - src/source.c
-void _dispatch_source_wakeup(dispatch_source_t ds, dispatch_qos_t qos,
-                             dispatch_wakeup_flags_t flags)
-{
-    dispatch_timer_source_refs_t dr = ds->ds_timer_refs;
-    dispatch_queue_wakeup_target_t tq = DISPATCH_QUEUE_WAKEUP_NONE;
-
-    if (!ds->ds_is_installed) {
-        // Timer source首次注册需要在管理队列中处理
-        tq = DISPATCH_QUEUE_WAKEUP_MGR;
-    } else if (_dispatch_source_refs_needs_configuration(dr)) {
-        // Timer配置变更也需要在管理队列中处理
-        tq = DISPATCH_QUEUE_WAKEUP_MGR;
-    }
-
-    if (tq) {
-        // 将注册/配置任务推送到管理队列
-        return _dispatch_queue_wakeup(ds, qos, flags, tq);
-    }
-    // 最终会调用_dispatch_source_invoke()
 }
 ```
 
@@ -464,54 +447,97 @@ void _dispatch_source_wakeup(dispatch_source_t ds, dispatch_qos_t qos,
 - 只有在`dispatch_resume()`调用`_dispatch_source_activate()`时，Timer才真正注册到系统
 - 如果Timer已激活，后续的`dispatch_source_set_timer()`会触发配置更新流程
 
+### 8. 触发管理队列处理（如果需要）
+
+```c
+// swift-corelibs-libdispatch - src/source.c
+void _dispatch_source_wakeup(dispatch_source_t ds, dispatch_qos_t qos,
+                             dispatch_wakeup_flags_t flags)
+{
+    dispatch_timer_source_refs_t dr = ds->ds_timer_refs;
+    dispatch_queue_wakeup_target_t tq = DISPATCH_QUEUE_WAKEUP_NONE;
+
+    if (!ds->ds_is_installed) {
+        // Timer source首次注册需要在管理队列中处理
+        tq = DISPATCH_QUEUE_WAKEUP_MGR;
+    } else if (_dispatch_source_refs_needs_configuration(dr)) {
+        // Timer配置变更也需要在管理队列中处理
+        tq = DISPATCH_QUEUE_WAKEUP_MGR;
+    }
+
+    if (tq) {
+        // 将注册/配置任务推送到管理队列
+        return _dispatch_queue_wakeup(ds, qos, flags, tq);
+    }
+}
+```
+
 ### 9. 管理队列任务处理
 
 ```c
-// swift-corelibs-libdispatch - src/event/event.c
-static void _dispatch_timer_unote_arm(dispatch_timer_source_refs_t dt,
-                                     dispatch_timer_heap_t dth, uint32_t tidx)
+// swift-corelibs-libdispatch - src/queue.c
+void _dispatch_mgr_queue_push(dispatch_lane_t dq, dispatch_object_t dou,
+                              dispatch_qos_t qos)
 {
-    if (_dispatch_unote_armed(dt)) {
-        // Timer已存在，更新heap位置
-        _dispatch_timer_heap_update(&dth[tidx], dt);
-    } else {
-        // 新Timer，插入heap
-        dt->du_ident = tidx;
-        _dispatch_timer_heap_insert(&dth[tidx], dt);
-        _dispatch_unote_state_set_bit(dt, DU_STATE_ARMED);
+    if (unlikely(_dispatch_queue_push_item(dq, dou))) {
+        dq_state = os_atomic_or2o(dq, dq_state, DISPATCH_QUEUE_DIRTY, release);
+        
+        if (!_dq_state_drain_locked_by_self(dq_state)) {
+            // 关键：触发Event Manager线程处理管理任务
+            _dispatch_event_loop_poke(DISPATCH_WLH_MANAGER, 0, 0);
+        }
     }
+}
 
-    // 标记heap dirty，等待批量kqueue重新编程
-    _dispatch_timers_heap_dirty(dth, tidx);
+static void _dispatch_mgr_queue_drain(void)
+{
+    if (dq->dq_items_tail) {
+        // 串行处理所有pending的管理任务
+        _dispatch_lane_serial_drain(dq, &dic, flags, &owned);
+    }
 }
 ```
 
 ### 10. Timer arm到heap和kqueue
 
 ```c
-// swift-corelibs-libdispatch - src/event/event_kevent.c
-static void _dispatch_event_loop_timer_program(dispatch_timer_heap_t dth, uint32_t tidx,
-                                              uint64_t target, uint64_t leeway, uint16_t action)
+// swift-corelibs-libdispatch - src/source.c
+void _dispatch_source_invoke(dispatch_source_t ds, dispatch_invoke_context_t dic,
+                             dispatch_invoke_flags_t flags)
 {
-    dispatch_wlh_t wlh = _dispatch_get_wlh();
+    // 最终在管理队列中执行，处理Timer的arm操作
+    if (!ds->ds_is_installed) {
+        _dispatch_source_install(ds, _dispatch_get_event_wlh(), pri);
+    }
     
-    dispatch_kevent_s ke = {
-        .ident = DISPATCH_KEVENT_TIMEOUT_IDENT_MASK | tidx,
-        .filter = EVFILT_TIMER,
-        .flags = action | EV_ONESHOT,
-        .fflags = _dispatch_timer_index_to_fflags[tidx],  // NOTE_ABSOLUTE | NOTE_LEEWAY等
-        .data = (int64_t)target,
-        .udata = (dispatch_kevent_udata_t)dth,
-#if DISPATCH_HAVE_TIMER_COALESCING
-        .ext[1] = leeway,  // Timer容差，用于节能优化
-#endif
-#if DISPATCH_USE_KEVENT_QOS
-        .qos = (__typeof__(ke.qos))_PTHREAD_PRIORITY_EVENT_MANAGER_FLAG,
-#endif
-    };
+    if (_dispatch_source_refs_needs_configuration(dr)) {
+        _dispatch_timer_unote_configure(ds->ds_timer_refs);
+    }
+}
 
-    // 延迟批量提交kqueue更新
-    _dispatch_kq_deferred_update(wlh, &ke);
+// swift-corelibs-libdispatch - src/event/event.c
+static void _dispatch_timer_unote_resume(dispatch_timer_source_refs_t dt)
+{
+    bool will_arm = _dispatch_timer_unote_needs_rearm(dt, 0);
+    uint32_t tidx = _dispatch_timer_unote_idx(dt);
+    dispatch_timer_heap_t dth = _dispatch_timer_unote_heap(dt);
+
+    if (will_arm) {
+        _dispatch_timer_unote_arm(dt, dth, tidx);
+    }
+}
+
+static void _dispatch_timer_unote_arm(dispatch_timer_source_refs_t dt,
+                                     dispatch_timer_heap_t dth, uint32_t tidx)
+{
+    if (_dispatch_unote_armed(dt)) {
+        _dispatch_timer_heap_update(&dth[tidx], dt);
+    } else {
+        dt->du_ident = tidx;
+        _dispatch_timer_heap_insert(&dth[tidx], dt);
+        _dispatch_unote_state_set_bit(dt, DU_STATE_ARMED);
+    }
+    _dispatch_timers_heap_dirty(dth, tidx);
 }
 ```
 
