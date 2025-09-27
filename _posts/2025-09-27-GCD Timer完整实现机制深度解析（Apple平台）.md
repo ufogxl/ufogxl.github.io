@@ -112,12 +112,6 @@ static void _dispatch_root_queues_init_once(void *context)
                 (pthread_workqueue_function_workloop_t)_dispatch_workloop_worker_thread,
                 offsetof(struct dispatch_queue_s, dq_serialnum), 0);
 #endif
-#if DISPATCH_USE_KEVENT_WORKQUEUE
-    } else if (wq_supported & WORKQ_FEATURE_KEVENT) {
-        r = _pthread_workqueue_init_with_kevent(_dispatch_worker_thread2,
-                (pthread_workqueue_function_kevent_t)_dispatch_kevent_worker_thread,
-                offsetof(struct dispatch_queue_s, dq_serialnum), 0);
-#endif
     }
 }
 ```
@@ -126,23 +120,74 @@ static void _dispatch_root_queues_init_once(void *context)
 - `_dispatch_kevent_worker_thread`就是Event Manager的实际入口函数
 - 支持workloop和kevent两种模式
 
-### 3. 防护机制
 
-```c
-// swift-corelibs-libdispatch - src/queue.c
-void _dispatch_mgr_thread(...)
-{
-#if DISPATCH_USE_KEVENT_WORKQUEUE
-    if (_dispatch_kevent_workqueue_enabled) {
-        DISPATCH_INTERNAL_CRASH(0, "Manager queue invoked with "
-                "kevent workqueue enabled");
-    }
-#endif
-    // 传统Manager线程代码...
-}
+## 完整流程时序图
+
+```mermaid
+sequenceDiagram
+    participant User as 用户代码
+    participant DS as dispatch_source
+    participant MQ as 管理队列
+    participant TH as Timer Heap
+    participant KQ as kqueue内核
+    participant PW as pthread_workqueue
+    participant EM as Event Manager线程
+    participant WT as Worker线程
+    participant CB as Timer回调
+
+    Note over User,CB: Timer创建和配置阶段
+    User->>DS: dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER)
+    User->>DS: dispatch_source_set_event_handler(^{ ... })
+    User->>DS: dispatch_source_set_timer(start, interval, leeway)
+    DS->>DS: _dispatch_timer_config_create() + os_atomic_store2o(dt_pending_config)
+    Note right of DS: Timer配置存储，但未激活
+
+    Note over User,CB: Timer激活阶段（关键步骤）
+    User->>DS: dispatch_resume() 或 dispatch_activate()
+    DS->>DS: _dispatch_lane_resume(activate=true/false)
+    DS->>DS: _dispatch_lane_resume_activate()
+    DS->>DS: _dispatch_source_activate()
+    DS->>DS: _dispatch_source_install()
+    DS->>DS: _dispatch_unote_register()
+    DS->>DS: _dispatch_timer_unote_register()
+    DS->>DS: _dispatch_timer_unote_configure() 应用pending配置
+    DS->>MQ: dx_wakeup(DISPATCH_QUEUE_WAKEUP_MGR)
+    MQ->>MQ: _dispatch_mgr_queue_push()
+    MQ->>PW: _dispatch_event_loop_poke(DISPATCH_WLH_MANAGER)
+    PW->>EM: 分配Event Manager线程处理管理任务
+    EM->>EM: _dispatch_mgr_queue_drain()
+    EM->>DS: _dispatch_source_invoke() 
+    DS->>TH: _dispatch_timer_unote_arm()
+    TH->>TH: _dispatch_timer_heap_insert()
+    TH->>TH: _dispatch_timers_heap_dirty()
+    TH->>KQ: _dispatch_event_loop_timer_program()
+    KQ->>KQ: kevent_qos(EVFILT_TIMER, EV_ADD | EV_ONESHOT)
+
+    Note over User,CB: Timer开始工作，等待触发
+
+    Note over User,CB: Timer触发阶段
+    KQ->>KQ: 内核检测Timer到期 filt_timertouch()
+    KQ->>PW: kevent_workq_internal() 投递事件
+    PW->>PW: workq_kevent_callback() 请求Event Manager
+    PW->>EM: _pthread_wqthread() 分配Event Manager线程
+    Note right of EM: WQ_FLAG_THREAD_KEVENT + _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG
+    EM->>EM: _dispatch_kevent_worker_thread()
+    EM->>EM: _dispatch_kevent_timer_drain() 标记dirty_bits
+    EM->>EM: _dispatch_event_loop_drain_anon_timers()
+    EM->>TH: _dispatch_timers_run() 检查heap找到到期timer
+    TH->>DS: _dispatch_source_merge_evt() 异步派发事件
+    DS->>PW: dx_wakeup(target_queue) 请求Worker线程
+
+    Note over User,CB: Timer回调执行阶段
+    PW->>WT: 分配普通Worker线程到目标队列
+    Note right of WT: 普通workqueue线程，无EVENT_MANAGER_FLAG
+    WT->>CB: 执行Timer事件处理块
+    WT->>PW: 归还线程到线程池
+    
+    Note over EM: Event Manager线程生命周期
+    EM->>EM: _dispatch_wlh_worker_thread_reset()
+    EM->>PW: 归还线程到pthread workqueue线程池
 ```
-
-**说明**：Apple平台启用kevent workqueue后，传统Manager线程路径会直接崩溃，确保不会有路径冲突。
 
 ## Timer注册和激活完整流程
 
@@ -763,74 +808,6 @@ static void _dispatch_source_merge_evt(dispatch_unote_t du, uint32_t flags,
     dx_wakeup(ds, _dispatch_qos_from_pp(pp), 
               DISPATCH_WAKEUP_EVENT | DISPATCH_WAKEUP_CONSUME_2 | DISPATCH_WAKEUP_MAKE_DIRTY);
 }
-```
-
-## 完整流程时序图
-
-```mermaid
-sequenceDiagram
-    participant User as 用户代码
-    participant DS as dispatch_source
-    participant MQ as 管理队列
-    participant TH as Timer Heap
-    participant KQ as kqueue内核
-    participant PW as pthread_workqueue
-    participant EM as Event Manager线程
-    participant WT as Worker线程
-    participant CB as Timer回调
-
-    Note over User,CB: Timer创建和配置阶段
-    User->>DS: dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER)
-    User->>DS: dispatch_source_set_event_handler(^{ ... })
-    User->>DS: dispatch_source_set_timer(start, interval, leeway)
-    DS->>DS: _dispatch_timer_config_create() + os_atomic_store2o(dt_pending_config)
-    Note right of DS: Timer配置存储，但未激活
-
-    Note over User,CB: Timer激活阶段（关键步骤）
-    User->>DS: dispatch_resume() 或 dispatch_activate()
-    DS->>DS: _dispatch_lane_resume(activate=true/false)
-    DS->>DS: _dispatch_lane_resume_activate()
-    DS->>DS: _dispatch_source_activate()
-    DS->>DS: _dispatch_source_install()
-    DS->>DS: _dispatch_unote_register()
-    DS->>DS: _dispatch_timer_unote_register()
-    DS->>DS: _dispatch_timer_unote_configure() 应用pending配置
-    DS->>MQ: dx_wakeup(DISPATCH_QUEUE_WAKEUP_MGR)
-    MQ->>MQ: _dispatch_mgr_queue_push()
-    MQ->>PW: _dispatch_event_loop_poke(DISPATCH_WLH_MANAGER)
-    PW->>EM: 分配Event Manager线程处理管理任务
-    EM->>EM: _dispatch_mgr_queue_drain()
-    EM->>DS: _dispatch_source_invoke() 
-    DS->>TH: _dispatch_timer_unote_arm()
-    TH->>TH: _dispatch_timer_heap_insert()
-    TH->>TH: _dispatch_timers_heap_dirty()
-    TH->>KQ: _dispatch_event_loop_timer_program()
-    KQ->>KQ: kevent_qos(EVFILT_TIMER, EV_ADD | EV_ONESHOT)
-
-    Note over User,CB: Timer开始工作，等待触发
-
-    Note over User,CB: Timer触发阶段
-    KQ->>KQ: 内核检测Timer到期 filt_timertouch()
-    KQ->>PW: kevent_workq_internal() 投递事件
-    PW->>PW: workq_kevent_callback() 请求Event Manager
-    PW->>EM: _pthread_wqthread() 分配Event Manager线程
-    Note right of EM: WQ_FLAG_THREAD_KEVENT + _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG
-    EM->>EM: _dispatch_kevent_worker_thread()
-    EM->>EM: _dispatch_kevent_timer_drain() 标记dirty_bits
-    EM->>EM: _dispatch_event_loop_drain_anon_timers()
-    EM->>TH: _dispatch_timers_run() 检查heap找到到期timer
-    TH->>DS: _dispatch_source_merge_evt() 异步派发事件
-    DS->>PW: dx_wakeup(target_queue) 请求Worker线程
-
-    Note over User,CB: Timer回调执行阶段
-    PW->>WT: 分配普通Worker线程到目标队列
-    Note right of WT: 普通workqueue线程，无EVENT_MANAGER_FLAG
-    WT->>CB: 执行Timer事件处理块
-    WT->>PW: 归还线程到线程池
-    
-    Note over EM: Event Manager线程生命周期
-    EM->>EM: _dispatch_wlh_worker_thread_reset()
-    EM->>PW: 归还线程到pthread workqueue线程池
 ```
 
 ## 关键设计特点与优势
