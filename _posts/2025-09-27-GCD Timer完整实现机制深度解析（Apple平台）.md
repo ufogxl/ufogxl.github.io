@@ -205,10 +205,223 @@ static void _dispatch_kq_init(void *context)
 
 ### 3.2 内核Timer机制（基于项目源码）
 
-#### timer_call 底层实现
+#### EVFILT_TIMER完整调用链路
+
+**1. Timer注册阶段**：
 
 ```c
-// osfmk/kern/timer_call.c
+// bsd/kern/kern_event.c - Timer创建和回调注册
+static int filt_timerattach(struct knote *kn, struct kevent_qos_s *kev)
+{
+    thread_call_t callout;
+    struct filt_timer_params params;
+    
+    // 验证Timer参数
+    if ((error = filt_timervalidate(kev, &params)) != 0) {
+        knote_set_error(kn, error);
+        return 0;
+    }
+
+    // 关键：分配thread_call并注册filt_timerexpire为回调函数
+    callout = thread_call_allocate_with_options(filt_timerexpire,
+        (thread_call_param_t)kn,           // 参数1：knote指针
+        THREAD_CALL_PRIORITY_HIGH,         // 高优先级
+        THREAD_CALL_OPTIONS_ONCE);         // 一次性回调
+
+    if (NULL == callout) {
+        knote_set_error(kn, ENOMEM);
+        return 0;
+    }
+
+    // 初始化Timer参数和状态
+    filt_timer_set_params(kn, &params);
+    kn->kn_thcall = callout;              // 保存thread_call到knote
+    kn->kn_flags |= EV_CLEAR;
+    os_atomic_store(&kn->kn_hook32, TIMER_IDLE, relaxed);
+
+    // 检查是否立即到期，否则启动定时器
+    if (filt_timer_is_ready(kn)) {
+        os_atomic_store(&kn->kn_hook32, TIMER_IMMEDIATE, relaxed);
+        return FILTER_ACTIVE;             // 立即激活
+    } else {
+        filt_timerarm(kn);                // 启动定时器
+        return 0;
+    }
+}
+```
+
+**2. Timer启动和内核注册**：
+
+```c
+// Timer启动：注册到内核thread_call系统
+static void filt_timerarm(struct knote *kn)
+{
+    uint64_t deadline = kn->kn_ext[0];    // 目标时间
+    uint64_t leeway   = kn->kn_ext[1];    // 允许延迟
+    uint32_t state;
+    
+    // 设置Timer标志（优先级、时钟类型等）
+    int filter_flags = kn->kn_sfflags;
+    unsigned int timer_flags = 0;
+    
+    if (filter_flags & NOTE_CRITICAL) {
+        timer_flags |= THREAD_CALL_DELAY_USER_CRITICAL;
+    } else if (filter_flags & NOTE_BACKGROUND) {
+        timer_flags |= THREAD_CALL_DELAY_USER_BACKGROUND;
+    } else {
+        timer_flags |= THREAD_CALL_DELAY_USER_NORMAL;
+    }
+    
+    if (filter_flags & NOTE_LEEWAY) {
+        timer_flags |= THREAD_CALL_DELAY_LEEWAY;
+    }
+    
+    if (filter_flags & NOTE_MACH_CONTINUOUS_TIME) {
+        timer_flags |= THREAD_CALL_CONTINUOUS;
+    }
+
+    // 原子更新Timer状态：IDLE -> ARMED，并增加世代计数
+    state = os_atomic_load(&kn->kn_hook32, relaxed);
+    state &= ~TIMER_STATE_MASK;
+    state += TIMER_GEN_INC + TIMER_ARMED;
+    os_atomic_store(&kn->kn_hook32, state, relaxed);
+
+    // 关键：将Timer注册到内核thread_call调度系统
+    // 当deadline到期时，内核会自动调用之前注册的filt_timerexpire回调
+    thread_call_enter_delayed_with_leeway(kn->kn_thcall,
+        (void *)(uintptr_t)state,         // 传递状态作为第二个参数
+        deadline,                         // 到期时间（绝对时间）
+        leeway,                          // 允许的延迟时间
+        timer_flags);                    // Timer标志和优先级
+}
+```
+
+**3. 内核调度系统核心机制**：
+
+```c
+// osfmk/kern/timer_call.c - 内核Timer调度核心
+static boolean_t timer_call_enter_internal(timer_call_t call, timer_call_param_t param1,
+                                          uint64_t deadline, uint64_t leeway, 
+                                          uint32_t flags, boolean_t ratelimited)
+{
+    mpqueue_head_t *queue = NULL;
+    uint64_t slop, sdeadline, ttd;
+    uint64_t ctime = mach_absolute_time();
+    
+    // 计算Timer的"松弛度"（允许延迟），用于节能优化
+    uint32_t urgency = (flags & TIMER_CALL_URGENCY_MASK);
+    boolean_t slop_ratelimited = FALSE;
+    slop = timer_call_slop(deadline, ctime, urgency, current_thread(), &slop_ratelimited);
+    
+    // 应用用户指定的leeway
+    if ((flags & TIMER_CALL_LEEWAY) != 0 && leeway > slop) {
+        slop = leeway;
+    }
+    
+    // 更新实际deadline
+    if (UINT64_MAX - deadline <= slop) {
+        deadline = UINT64_MAX;
+    } else {
+        deadline += slop;
+    }
+    
+    // 处理过期Timer
+    if (__improbable(deadline < ctime)) {
+        deadline = timer_call_past_deadline_timer_handle(deadline, ctime);
+        sdeadline = deadline;
+    }
+    
+    // 将Timer加入到适当的优先级队列中
+    // 内核会定期扫描这些队列，执行到期的Timer回调
+    queue = timer_call_enqueue_deadline_unlocked(call, queue, deadline, 
+                                                sdeadline, ttd, param1, flags);
+    return true;
+}
+```
+
+**4. 内核Timer到期检测和回调执行**：
+
+```c
+// 内核定期调用此函数检查到期Timer
+uint64_t timer_queue_expire_with_options(mpqueue_head_t *queue, uint64_t deadline, boolean_t rescan)
+{
+    timer_call_t call = NULL;
+    uint32_t tc_iterations = 0;
+    uint64_t cur_deadline = deadline;
+    
+    timer_queue_lock_spin(queue);
+    
+    // 遍历Timer队列，找到所有到期的Timer
+    while (!queue_empty(&queue->head)) {
+        call = 队列中的下一个Timer;
+        
+        if (call->tc_pqlink.deadline <= deadline) {
+            // Timer到期，从队列中移除
+            timer_call_entry_dequeue(call);
+            
+            // 执行Timer回调 - 这里会调用到filt_timerexpire
+            call->tc_func(call->tc_param0, call->tc_param1);
+            
+            tc_iterations++;
+        } else {
+            break;  // 队列已排序，后续Timer都未到期
+        }
+    }
+    
+    timer_queue_unlock(queue);
+    return cur_deadline;
+}
+```
+
+**5. Timer到期回调处理**：
+
+```c
+// bsd/kern/kern_event.c - Timer到期时的回调函数
+static void filt_timerexpire(void *knx, void *state_on_arm)
+{
+    struct knote *kn = knx;                           // 参数1：knote指针
+    uint32_t state = (uint32_t)(uintptr_t)state_on_arm;   // 参数2：启动时的状态
+
+    // 原子状态转换：TIMER_ARMED -> TIMER_FIRED
+    uint32_t fired_state = state ^ TIMER_ARMED ^ TIMER_FIRED;
+
+    // 使用CAS确保状态转换的原子性和世代检查
+    if (os_atomic_cmpxchg(&kn->kn_hook32, state, fired_state, relaxed)) {
+        // 状态更新成功，说明这是有效的Timer触发
+        struct kqueue *kq = knote_get_kq(kn);
+        kqlock(kq);
+        knote_activate(kq, kn, FILTER_ACTIVE);  // 激活kqueue事件
+        kqunlock(kq);
+    } else {
+        /*
+         * 状态更新失败，说明Timer已被重新编程或取消
+         * 这是一个延迟到达的Timer触发，应该忽略
+         * 这种情况在Timer被快速重设或取消时会发生
+         */
+    }
+}
+```
+
+#### Timer状态机和世代管理
+
+```c
+// Timer状态定义
+#define TIMER_IDLE       0x0    // Timer从未调度或已取消
+#define TIMER_ARMED      0x1    // Timer已调度等待触发
+#define TIMER_FIRED      0x2    // Timer已触发等待处理
+#define TIMER_IMMEDIATE  0x3    // Timer在注册时立即触发
+#define TIMER_STATE_MASK 0x3    // 状态掩码
+#define TIMER_GEN_INC    0x4    // 世代计数器增量
+
+// 世代管理机制防止过期Timer的延迟触发
+// 每次重新启动Timer时，世代计数器递增
+// filt_timerexpire检查世代计数确保只处理当前有效的Timer触发
+```
+
+#### running_timers 处理器级Timer
+
+```c
+// osfmk/kern/timer_call.c - 处理器级别的Timer处理
 bool running_timers_expire(processor_t processor, uint64_t now)
 {
     bool expired = false;
@@ -217,7 +430,7 @@ bool running_timers_expire(processor_t processor, uint64_t now)
         return expired;
     }
     
-    // 遍历处理器上的所有运行中Timer
+    // 检查处理器上的所有运行中Timer（量子Timer、抢占Timer等）
     for (int i = 0; i < RUNNING_TIMER_MAX; i++) {
         struct timer_call *call = &processor->running_timers[i];
         
@@ -233,22 +446,6 @@ bool running_timers_expire(processor_t processor, uint64_t now)
     }
     
     return expired;
-}
-```
-
-#### EVFILT_TIMER处理器
-
-```c
-// 内核检测到Timer到期时的处理流程
-static int filt_timerexpire(struct knote *kn, struct kevent_qos_s *kev)
-{
-    // 标记事件已触发
-    kn->kn_hookid = 0;
-    kn->kn_data = 1;
-    
-    // 投递到workqueue进行异步处理
-    return kevent_workq_internal(kn->kn_kq, kev, 1, NULL, 0, 
-                                KEVENT_FLAG_WORKQ | KEVENT_FLAG_IMMEDIATE);
 }
 ```
 
