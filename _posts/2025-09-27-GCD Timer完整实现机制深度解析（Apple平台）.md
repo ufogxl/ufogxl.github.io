@@ -1,6 +1,29 @@
-# GCD Timer完整机制解析
+# GCD Timer内核监听机制与执行流程
 
-## 时序图概览
+## 1. 架构概述
+
+### 1.1 三层分工模式
+
+| 层次 | 组件 | 职责 | 线程类型 |
+|------|------|------|----------|
+| **监听层** | 内核kqueue + EVFILT_TIMER | 高精度时间监控，零轮询 | 内核级 |
+| **检测层** | Event Manager线程 + Timer Heap | 批量检测到期Timer，异步派发 | 临时分配 |
+| **执行层** | Worker线程 + 目标队列 | 执行用户Timer回调 | 按需分配 |
+
+### 1.2 核心数据结构关系
+
+```mermaid
+graph TD
+    A[dispatch_source_t] -->|包含| B[dispatch_timer_source_refs_t]
+    B -->|注册到| C[全局Timer Heap数组]
+    C -->|双重最小堆| D[Target时间堆]
+    C -->|双重最小堆| E[Deadline时间堆]
+    B -->|生成| F[dispatch_kevent_s]
+    F -->|注册到| G[内核kqueue]
+    G -->|监听| H[EVFILT_TIMER事件]
+```
+
+### 1.3 时序图
 
 ```mermaid
 sequenceDiagram
@@ -12,190 +35,114 @@ sequenceDiagram
     participant TH as Timer Heap
     participant WT as Worker线程
 
-    Note over User,WT: 第一阶段：Timer创建和激活
-    User->>DS: dispatch_source_create(TIMER)
-    User->>DS: dispatch_source_set_timer(start, interval, leeway)
+    Note over User,WT: 阶段1：Timer创建和激活
     User->>DS: dispatch_resume()
-    DS->>DS: _dispatch_source_wakeup() 第一次调用
+    DS->>DS: _dispatch_source_wakeup() [第1次]
     Note right of DS: 条件: !ds->ds_is_installed
     DS->>EM: 派发到管理队列
     EM->>TH: 注册到全局timer heap
     EM->>KQ: 创建EVFILT_TIMER事件
     Note right of DS: ds->ds_is_installed = true
 
-    Note over User,WT: 第二阶段：Timer监听和触发
+    Note over User,WT: 阶段2：Timer监听和触发
     KQ->>KQ: 内核Timer wheel检测到期
-    KQ->>PW: kevent_workq_internal() 投递EVFILT_TIMER事件
-    PW->>EM: 分配Event Manager线程 (_dispatch_kevent_worker_thread)
-    EM->>EM: _dispatch_kevent_timer_drain() 标记timer索引dirty
-    EM->>TH: _dispatch_event_loop_drain_anon_timers() 批量检查
-    TH->>TH: _dispatch_timers_run() 遍历heap找到期Timer
-    TH->>DS: _dispatch_source_merge_evt() 设置pending_data
-    DS->>DS: _dispatch_source_wakeup() 第二次调用
+    KQ->>PW: kevent_workq_internal() 投递事件
+    PW->>EM: 分配Event Manager线程
+    EM->>TH: 批量检查timer heap
+    TH->>DS: 设置pending_data
+    DS->>DS: _dispatch_source_wakeup() [第2次]
     Note right of DS: 条件: ds_pending_data != 0
     DS->>WT: 派发到目标队列
     WT->>User: 执行Timer回调
 ```
 
-## 架构概览
+## 2. Timer注册到内核流程
 
-GCD Timer采用三层分工架构：
+### 2.1 用户API调用链
 
-```
-┌─────────────────────┐
-│   Timer回调执行     │ ← Worker线程（普通workqueue线程）
-├─────────────────────┤
-│   Timer检测派发     │ ← Event Manager线程（临时分配）
-├─────────────────────┤
-│   Timer事件监听     │ ← 内核kqueue（系统级常驻）
-└─────────────────────┘
-```
-
-## 详细实现机制
-
-### 1. Timer创建和注册
-
-#### 用户API调用
 ```c
+// 用户代码
 dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
-dispatch_source_set_event_handler(timer, ^{ /* 回调逻辑 */ });
 dispatch_source_set_timer(timer, start, interval, leeway);
-dispatch_resume(timer);  // 关键：立即激活并注册
+dispatch_resume(timer);  // 关键：立即触发注册
 ```
 
-#### 内部注册流程
+### 2.2 内部注册流程
+
+#### 第一次 _dispatch_source_wakeup 调用
+
+**触发条件**: `!ds->ds_is_installed`
+
 ```c
-// dispatch_resume() 触发的内部流程
-void _dispatch_source_activate(dispatch_source_t ds, bool *allow_resume)
+void _dispatch_source_wakeup(dispatch_source_t ds, dispatch_qos_t qos, dispatch_wakeup_flags_t flags)
 {
+    // 判断序列 - 按优先级
     if (!ds->ds_is_installed) {
-        _dispatch_source_install(ds, wlh, pri);  // 立即注册到系统
+        // 第一次：Timer需要安装到kevent队列
+        tq = DISPATCH_QUEUE_WAKEUP_MGR;  // 派发到管理队列
     }
-}
-
-static void _dispatch_source_install(dispatch_source_t ds, dispatch_wlh_t wlh,
-                                    dispatch_priority_t pri)
-{
-    ds->ds_is_installed = true;
-    _dispatch_unote_register(dr, wlh, pri);  // 注册到全局timer heap
+    
+    return _dispatch_queue_wakeup(ds, qos, flags, tq);
 }
 ```
 
-#### Timer数据结构
+**执行路径**:
+```
+dispatch_resume() 
+  → _dispatch_source_activate() 
+  → dx_wakeup() 
+  → 管理队列处理
+  → _dispatch_source_install()
+  → _dispatch_unote_register()
+  → _dispatch_timer_unote_register()
+```
+
+### 2.3 Timer数据结构初始化
+
 ```c
 typedef struct dispatch_timer_source_refs_s {
-    struct dispatch_timer_source_s dt_timer;    // Timer配置（target, interval, deadline）
-    uint32_t dt_heap_entry[DTH_ID_COUNT];      // 在Timer heap中的位置索引
+    struct dispatch_timer_source_s dt_timer;    // Timer配置：target, interval, deadline
+    uint32_t dt_heap_entry[DTH_ID_COUNT];      // 在Timer heap中的双重索引位置
     dispatch_timer_config_t dt_pending_config;  // 待应用的配置更新
-    uint32_t du_ident;                         // Timer在kqueue中的标识符
-    uint8_t du_timer_flags;                    // Timer标志（时钟类型、QoS等）
+    uint32_t du_ident;                         // Timer在kqueue中的唯一标识符
+    uint8_t du_timer_flags;                    // Timer标志：时钟类型、QoS等
 } *dispatch_timer_source_refs_t;
 ```
 
-#### 全局Timer Heap管理
+### 2.4 全局Timer Heap注册
 
-```c
-// 全局timer heap数组 - 所有Timer的统一存储
-DISPATCH_GLOBAL(struct dispatch_timer_heap_s _dispatch_timers_heap[DISPATCH_TIMER_COUNT]);
-
-// 每个heap的结构
-typedef struct dispatch_timer_heap_s {
-    uint32_t dth_count;                              // heap中Timer数量
-    uint8_t dth_segments;                            // 分段数量（动态扩容）
-    uint8_t dth_max_qos;                            // heap中最高QoS级别
-    uint8_t dth_dirty_bits;                         // 脏位标记（仅第一个heap使用）
-    uint8_t dth_armed : 1;                         // 是否已注册到kqueue
-    uint8_t dth_needs_program : 1;                 // 是否需要重新编程kqueue
-    dispatch_timer_source_refs_t dth_min[DTH_ID_COUNT];  // 最小堆顶元素（target和deadline）
-    void **dth_heap;                               // 分段存储的heap数据
-} *dispatch_timer_heap_t;
-```
-
-**Timer分类和索引计算**：
+#### 索引计算和分类存储
 
 ```c
 // Timer根据时钟类型和QoS级别分配到不同heap
 static inline unsigned int _dispatch_timer_unote_idx(dispatch_timer_source_refs_t dt)
 {
     dispatch_clock_t clock = _dispatch_timer_flags_to_clock(dt->du_timer_flags);
-    uint32_t qos = 0;
-
-#if DISPATCH_HAVE_TIMER_QOS
-    // 提取QoS相关标志
-    qos = dt->du_timer_flags & (DISPATCH_TIMER_STRICT|DISPATCH_TIMER_BACKGROUND);
-#endif
-
-    // 计算在全局数组中的索引：DISPATCH_TIMER_INDEX(clock, qos)
+    uint32_t qos = dt->du_timer_flags & (DISPATCH_TIMER_STRICT|DISPATCH_TIMER_BACKGROUND);
+    
+    // 计算在全局数组中的索引
     // 例如：UPTIME时钟 + NORMAL QoS = 索引0，WALL时钟 + BACKGROUND QoS = 索引N
     return DISPATCH_TIMER_INDEX(clock, qos);
 }
 ```
 
-**双重最小堆结构**：
-
-每个heap实际上包含两个交错存储的最小堆：
-- **偶数索引**：按target时间排序的最小堆
-- **奇数索引**：按deadline时间排序的最小堆
+#### 双重最小堆插入
 
 ```c
-#define DTH_TARGET_ID   0u    // target时间堆ID
-#define DTH_DEADLINE_ID 1u    // deadline时间堆ID
-#define DTH_ID_COUNT    2u    // 两个堆
-
-// 堆顶元素直接存储在heap结构中
-dth->dth_min[DTH_TARGET_ID]   // target最小堆的根
-dth->dth_min[DTH_DEADLINE_ID] // deadline最小堆的根
-```
-
-**分段动态存储**：
-
-为了支持动态扩容，heap使用分段存储：
-
-```c
-// 分段容量计算
-#define DISPATCH_HEAP_INIT_SEGMENT_CAPACITY 8u
-
-static inline uint32_t _dispatch_timer_heap_capacity(uint32_t segments)
-{
-    if (segments == 0) return 2;  // 只有堆顶的两个元素
-    uint32_t seg_no = segments - 1;
-    // 总容量 = 2 + 8 + 8 + 16 + 32 + ... - seg_no
-    return 2 + (DISPATCH_HEAP_INIT_SEGMENT_CAPACITY << seg_no) - seg_no;
-}
-
-// 存储布局示例：
-// segment 0: [8个Timer指针]
-// segment 1: [8个Timer指针]  
-// segment 2: [16个Timer指针]
-// segment n: [常规Timer指针... | seg_n-1_ptr | seg_k_ptr | seg_0_ptr]
-```
-
-**Timer插入操作**：
-
-```c
-static void _dispatch_timer_heap_insert(dispatch_timer_heap_t dth,
-        dispatch_timer_source_refs_t dt)
+static void _dispatch_timer_heap_insert(dispatch_timer_heap_t dth, dispatch_timer_source_refs_t dt)
 {
     uint32_t idx = (dth->dth_count += DTH_ID_COUNT) - DTH_ID_COUNT;
 
-    // 更新heap的最高QoS
-    dispatch_qos_t qos = MAX(_dispatch_priority_qos(dt->du_priority),
-            _dispatch_priority_fallback_qos(dt->du_priority));
-    if (dth->dth_max_qos < qos) {
-        dth->dth_max_qos = (uint8_t)qos;
-        dth->dth_needs_program = true;  // 需要重新编程kqueue
-    }
-
     if (idx == 0) {
         // 第一个Timer，直接设为堆顶
-        dth->dth_needs_program = true;
+        dth->dth_needs_program = true;  // 标记需要编程kqueue
         dt->dt_heap_entry[DTH_TARGET_ID] = DTH_TARGET_ID;
         dt->dt_heap_entry[DTH_DEADLINE_ID] = DTH_DEADLINE_ID;
         dth->dth_min[DTH_TARGET_ID] = dth->dth_min[DTH_DEADLINE_ID] = dt;
         return;
     }
 
-    // 检查是否需要扩容
+    // 扩容检查
     if (unlikely(idx + DTH_ID_COUNT > _dispatch_timer_heap_capacity(dth->dth_segments))) {
         _dispatch_timer_heap_grow(dth);
     }
@@ -206,65 +153,35 @@ static void _dispatch_timer_heap_insert(dispatch_timer_heap_t dth,
 }
 ```
 
-**Timer查找和访问**：
+### 2.5 kqueue事件注册
 
 ```c
-// 获取heap中指定位置的Timer
-static inline dispatch_timer_source_refs_t *
-_dispatch_timer_heap_get_slot(dispatch_timer_heap_t dth, uint32_t idx)
+static void _dispatch_event_loop_timer_program(dispatch_timer_heap_t dth, uint32_t tidx,
+        uint64_t target, uint64_t leeway, uint16_t action)
 {
-    if (idx < DTH_ID_COUNT) {
-        return &dth->dth_min[idx];  // 堆顶元素
-    }
+    dispatch_kevent_s ke = {
+        .ident = DISPATCH_KEVENT_TIMEOUT_IDENT_MASK | tidx,  // Timer唯一标识
+        .filter = EVFILT_TIMER,                              // 内核Timer过滤器
+        .flags = action | EV_ONESHOT,                        // 一次性触发
+        .fflags = _dispatch_timer_index_to_fflags[tidx],     // 时钟类型标志
+        .data = (int64_t)target,                             // 触发时间（绝对时间）
+        .ext[1] = leeway,                                    // 允许的延迟时间
+        .qos = _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG,         // Event Manager优先级
+    };
     
-    idx -= DTH_ID_COUNT;
-    // 计算在哪个segment中
-    uint32_t seg_no = 0;
-    uint32_t capacity = DISPATCH_HEAP_INIT_SEGMENT_CAPACITY;
-    
-    while (idx >= capacity) {
-        idx -= capacity;
-        seg_no++;
-        capacity <<= 1;  // 下一个segment容量翻倍
-    }
-    
-    // 通过segment链找到实际存储位置
-    void **segment = dth->dth_heap;
-    for (uint32_t i = dth->dth_segments - 1; i > seg_no; i--) {
-        segment = segment[_dispatch_timer_heap_capacity(i) - i];
-    }
-    
-    return (dispatch_timer_source_refs_t *)&segment[idx];
+    _dispatch_kq_deferred_update(wlh, &ke);  // 批量更新kqueue，减少系统调用
 }
 ```
 
-**批量处理和dirty标记**：
+**关键特点**:
+- **立即生效**: `dispatch_resume()`调用后立即注册，不需等待
+- **批量操作**: 使用deferred update减少系统调用开销
+- **高精度**: 支持纳秒级时间精度和leeway优化
 
-```c
-// 使用dirty位来批量处理heap更新
-static inline void _dispatch_timers_heap_dirty(dispatch_timer_heap_t dth, uint32_t tidx)
-{
-    // 注意：dirty位只在第一个heap中维护，用于全局协调
-    dth[0].dth_dirty_bits |= (1 << DISPATCH_TIMER_QOS(tidx)) | DTH_DIRTY_GLOBAL;
-}
+## 3. 内核监听机制
 
-// 批量处理所有dirty的heap
-static inline void _dispatch_event_loop_drain_anon_timers(void)
-{
-    if (_dispatch_timers_heap[0].dth_dirty_bits) {
-        _dispatch_event_loop_drain_timers(_dispatch_timers_heap, DISPATCH_TIMER_COUNT);
-    }
-}
-```
+### 3.1 kqueue工作队列集成
 
-**关键特点**：
-- 所有Timer统一管理在全局heap中，与目标队列类型无关
-- 每个QoS级别维护独立的Timer heap
-- Timer注册立即生效，无需等待
-
-### 2. 内核事件监听层
-
-#### kqueue初始化
 ```c
 static void _dispatch_kq_init(void *context)
 {
@@ -280,47 +197,88 @@ static void _dispatch_kq_init(void *context)
         .udata = (dispatch_kevent_udata_t)DISPATCH_WLH_MANAGER,
     };
     
-    // 注册到内核kqueue，启用workqueue模式
+    // 启用workqueue模式，委托线程管理给pthread工作队列
     kevent_qos(kqfd, &ke, 1, NULL, 0, NULL, NULL,
                KEVENT_FLAG_WORKQ|KEVENT_FLAG_IMMEDIATE);
 }
 ```
 
-#### Timer注册到kqueue
+### 3.2 内核Timer机制（基于项目源码）
+
+#### timer_call 底层实现
+
 ```c
-static void _dispatch_event_loop_timer_program(dispatch_timer_heap_t dth, uint32_t tidx,
-        uint64_t target, uint64_t leeway, uint16_t action)
+// osfmk/kern/timer_call.c
+bool running_timers_expire(processor_t processor, uint64_t now)
 {
-    dispatch_kevent_s ke = {
-        .ident = DISPATCH_KEVENT_TIMEOUT_IDENT_MASK | tidx,  // Timer标识
-        .filter = EVFILT_TIMER,
-        .flags = action | EV_ONESHOT,
-        .fflags = _dispatch_timer_index_to_fflags[tidx],     // 时钟类型
-        .data = (int64_t)target,                             // 触发时间
-        .ext[1] = leeway,                                    // 允许的延迟
-        .qos = _PTHREAD_PRIORITY_EVENT_MANAGER_FLAG,
-    };
+    bool expired = false;
     
-    _dispatch_kq_deferred_update(wlh, &ke);  // 批量更新kqueue
+    if (!processor->running_timers_active) {
+        return expired;
+    }
+    
+    // 遍历处理器上的所有运行中Timer
+    for (int i = 0; i < RUNNING_TIMER_MAX; i++) {
+        struct timer_call *call = &processor->running_timers[i];
+        
+        uint64_t deadline = call->tc_pqlink.deadline;
+        if (deadline > now) {
+            continue;  // 未到期
+        }
+        
+        expired = true;
+        timer_call_trace_expire_entry(call);
+        call->tc_func(call->tc_param0, call->tc_param1);  // 执行回调
+        timer_call_trace_expire_return(call);
+    }
+    
+    return expired;
 }
 ```
 
-**监听机制特点**：
-- 基于内核EVFILT_TIMER，零轮询
-- 支持纳秒级精度
-- 支持leeway（延迟容忍）优化功耗
+#### EVFILT_TIMER处理器
 
-### 3. Event Manager线程检测层
-
-#### 线程分配和类型判断
 ```c
-// pthread workqueue分配线程入口
+// 内核检测到Timer到期时的处理流程
+static int filt_timerexpire(struct knote *kn, struct kevent_qos_s *kev)
+{
+    // 标记事件已触发
+    kn->kn_hookid = 0;
+    kn->kn_data = 1;
+    
+    // 投递到workqueue进行异步处理
+    return kevent_workq_internal(kn->kn_kq, kev, 1, NULL, 0, 
+                                KEVENT_FLAG_WORKQ | KEVENT_FLAG_IMMEDIATE);
+}
+```
+
+**监听机制特性**:
+- **零轮询**: 基于内核事件机制，不消耗CPU
+- **高精度**: 内核timer wheel提供纳秒级精度
+- **多时钟支持**: 支持UPTIME、MONOTONIC、WALL时钟
+- **节能优化**: leeway参数允许系统合并Timer触发
+
+## 4. Event处理线程启动流程
+
+### 4.1 pthread workqueue线程分配
+
+```c
+// 内核投递EVFILT_TIMER事件到pthread workqueue
+kevent_workq_internal() 
+  → workq_kevent_callback()     // 内核workqueue回调
+  → _pthread_wqthread()         // 带WQ_FLAG_THREAD_KEVENT标志
+  → _dispatch_kevent_worker_thread()  // GCD事件处理入口
+```
+
+### 4.2 线程类型判断和角色分配
+
+```c
 static void _dispatch_kevent_worker_thread(void **buf, int *count)
 {
     dispatch_kevent_t events = (dispatch_kevent_t)*buf;
     int nevents = *count;
     
-    // 关键：线程类型判断
+    // 关键：判断线程类型
     bool is_manager = _dispatch_wlh_worker_thread_init(&ddi);
     
     // 处理接收到的kevent事件
@@ -329,12 +287,16 @@ static void _dispatch_kevent_worker_thread(void **buf, int *count)
     if (is_manager) {
         // Event Manager线程执行路径
         _dispatch_mgr_queue_drain();                // 处理管理队列任务
-        _dispatch_event_loop_drain_anon_timers();   // 处理timer事件
+        _dispatch_event_loop_drain_anon_timers();   // 批量处理timer事件
         _dispatch_wlh_worker_thread_reset();        // 重置状态，归还线程
     }
+    // 普通Worker线程直接返回，继续处理其他任务
 }
+```
 
-// 线程类型判断实现
+#### 线程角色判断机制
+
+```c
 static inline bool _dispatch_wlh_worker_thread_init(dispatch_deferred_items_t ddi)
 {
     pthread_priority_t pp = _dispatch_get_priority();
@@ -351,22 +313,22 @@ static inline bool _dispatch_wlh_worker_thread_init(dispatch_deferred_items_t dd
 }
 ```
 
-#### Timer到期检测和派发
+### 4.3 Timer事件批量检测
+
 ```c
-// Timer事件处理主循环
 void _dispatch_event_loop_drain_anon_timers(void)
 {
     dispatch_timer_heap_t dth = &_dispatch_timers[DISPATCH_TIMER_QOS_COUNT];
     uint32_t count = DISPATCH_TIMER_COUNT;
-    dispatch_clock_now_cache_t nows = { };
+    dispatch_clock_now_cache_t nows = { };  // 时间缓存，避免重复系统调用
 
     do {
-        // 第一轮：检查到期Timer
+        // 第一轮：检查所有Timer heap中的到期Timer
         for (uint32_t tidx = 0; tidx < count; tidx++) {
             _dispatch_timers_run(dth, tidx, &nows);
         }
         
-        // 第二轮：重新编程需要更新的Timer
+        // 第二轮：重新编程需要更新的Timer到kqueue
         for (uint32_t tidx = 0; tidx < count; tidx++) {
             if (dth[tidx].dth_needs_program) {
                 _dispatch_timers_program(dth, tidx, &nows);
@@ -374,8 +336,11 @@ void _dispatch_event_loop_drain_anon_timers(void)
         }
     } while (unlikely(dth[0].dth_dirty_bits));  // 处理批处理期间的新变更
 }
+```
 
-// Timer到期检测实现
+#### 具体Timer到期检测逻辑
+
+```c
 static void _dispatch_timers_run(dispatch_timer_heap_t dth, uint32_t tidx,
                                 dispatch_clock_now_cache_t nows)
 {
@@ -386,7 +351,7 @@ static void _dispatch_timers_run(dispatch_timer_heap_t dth, uint32_t tidx,
     while ((dr = dth[tidx].dth_min[DTH_TARGET_ID])) {
         now = _dispatch_time_now_cached(DISPATCH_TIMER_CLOCK(tidx), nows);
         if (dr->dt_timer.target > now) {
-            break;  // 未到期，结束检查
+            break;  // 未到期，结束检查（最小堆特性）
         }
         
         // 处理到期Timer
@@ -394,31 +359,42 @@ static void _dispatch_timers_run(dispatch_timer_heap_t dth, uint32_t tidx,
             // 一次性Timer：解除武装并派发
             _dispatch_timer_unote_disarm(dr, dth);
             os_atomic_store2o(dr, ds_pending_data, 2, relaxed);
-            dux_merge_evt(dr, EV_ONESHOT, 0, 0);
+            dux_merge_evt(dr, EV_ONESHOT, 0, 0);  // 触发第二次wakeup
         } else {
             // 重复Timer：重新计算下次触发时间
             uint64_t interval = dr->dt_timer.interval;
             if (interval > 0) {
                 dr->dt_timer.target += interval;
-                _dispatch_timer_heap_update(&dth[tidx], dr);
+                _dispatch_timer_heap_update(&dth[tidx], dr);  // 重新堆化
                 os_atomic_store2o(dr, ds_pending_data, 1, relaxed);
-                dux_merge_evt(dr, 0, 0, 0);
+                dux_merge_evt(dr, 0, 0, 0);  // 触发第二次wakeup
             }
         }
     }
 }
 ```
 
-#### 异步事件派发
+**Event Manager线程特点**:
+- **临时分配**: 从pthread workqueue临时获取，用完即还
+- **批量处理**: 一次性检查所有Timer heap，提高效率
+- **优先级管理**: 使用Event Manager专用优先级标志
+- **状态同步**: 处理完毕后重置线程状态
+
+## 5. Callback提交到目标队列流程
+
+### 5.1 第二次 _dispatch_source_wakeup 调用
+
+**触发条件**: Timer到期，Event Manager设置了 `ds_pending_data`
+
 ```c
-// Timer事件派发到目标队列
+// _dispatch_timers_run() 中找到到期Timer后调用
 static void _dispatch_source_merge_evt(dispatch_unote_t du, uint32_t flags,
                                       uintptr_t data, uintptr_t status, 
                                       pthread_priority_t pp)
 {
     dispatch_source_t ds = _dispatch_source_from_refs(du._ds);
     
-    // 设置pending数据，用于用户回调获取触发次数
+    // 设置pending数据，供用户回调获取触发次数
     os_atomic_store2o(du._ds, ds_pending_data, data, relaxed);
     
     // 关键：异步唤醒目标队列，请求Worker线程执行Timer回调
@@ -427,186 +403,73 @@ static void _dispatch_source_merge_evt(dispatch_unote_t du, uint32_t flags,
 }
 ```
 
-**Event Manager特点**：
-- 临时分配，用完即还
-- 批量处理timer heap更新，提高效率
-- 异步派发，不阻塞检测流程
-
-### 4. Worker线程执行层
-
-#### Timer回调执行
-- 普通workqueue线程执行用户Timer回调
-- 运行在Timer source指定的目标队列QoS上下文
-- 支持优先级继承和QoS传播
-- 执行完毕后归还线程到线程池
-
-#### Timer数据获取
-```c
-// 用户回调中获取Timer触发信息
-DISPATCH_ALWAYS_INLINE
-static inline unsigned long
-_dispatch_source_timer_data(dispatch_timer_source_refs_t dr, uint64_t prev)
-{
-    unsigned long data = (unsigned long)prev >> 1;
-    
-    // 与_dispatch_timers_run()的release barrier配对
-    uint64_t now = os_atomic_load2o(dr, ds_pending_data, acquire);
-    if ((now & DISPATCH_TIMER_DISARMED_MARKER) && data) {
-        data = (unsigned long)now >> 1;
-    }
-    
-    return data;  // 返回Timer触发次数
-}
-```
-
-## _dispatch_source_wakeup的两次关键调用
-
-GCD Timer在生命周期中会经过 `_dispatch_source_wakeup` 两次关键调用，每次有不同的判断条件和执行路径。
-
-### 核心判断逻辑
+### 5.2 目标队列唤醒机制
 
 ```c
-void _dispatch_source_wakeup(dispatch_source_t ds, dispatch_qos_t qos,
-        dispatch_wakeup_flags_t flags)
+void _dispatch_source_wakeup(dispatch_source_t ds, dispatch_qos_t qos, dispatch_wakeup_flags_t flags)
 {
     dispatch_source_refs_t dr = ds->ds_refs;
-    dispatch_queue_wakeup_target_t dkq = DISPATCH_QUEUE_WAKEUP_MGR;    // 默认管理队列
     dispatch_queue_wakeup_target_t tq = DISPATCH_QUEUE_WAKEUP_NONE;
 
-    // 关键判断序列 - 按优先级顺序
-    if (!ds->ds_is_installed) {
-        // 第一次：Timer需要安装到kevent队列
-        tq = dkq;
-    } else if (!(dqf & (DSF_CANCELED | DQF_RELEASED)) &&
+    // 第二次调用的判断条件
+    if (!(dqf & (DSF_CANCELED | DQF_RELEASED)) &&
             os_atomic_load2o(dr, ds_pending_data, relaxed)) {
-        // 第二次：Timer有pending数据需要派发到目标队列
+        // Timer有pending数据需要派发到目标队列
         tq = DISPATCH_QUEUE_WAKEUP_TARGET;
     }
-    // ... 其他条件判断
 
     return _dispatch_queue_wakeup(ds, qos, flags, tq);
 }
 ```
 
-### 第一次调用：Timer激活安装
+### 5.3 Worker线程分配和回调执行
 
-**何时触发**：`dispatch_resume()` → `_dispatch_source_activate()` → `dx_wakeup()`
+#### 队列状态更新和线程请求
 
-**判断条件**：`!ds->ds_is_installed`
-
-**执行目标**：管理队列 (`DISPATCH_QUEUE_WAKEUP_MGR`)
-
-**主要任务**：
-- 注册Timer到全局timer heap
-- 创建kqueue事件 (`EVFILT_TIMER`)
-- 设置 `ds->ds_is_installed = true`
-
-**执行路径**：
 ```c
-管理队列处理 → _dispatch_source_install() 
-              → _dispatch_unote_register() 
-              → _dispatch_timer_unote_register()
-              → _dispatch_timer_unote_arm() 
-              → 注册到全局heap和kqueue
-```
-
-### 第二次调用：Timer到期派发
-
-**何时触发**：Event Manager线程检测到Timer到期 → `_dispatch_source_merge_evt()` → `dx_wakeup()`
-
-**判断条件**：`os_atomic_load2o(dr, ds_pending_data, relaxed)`
-
-**执行目标**：Timer的目标队列 (`DISPATCH_QUEUE_WAKEUP_TARGET`)
-
-**主要任务**：
-- 唤醒目标队列
-- 请求Worker线程
-- 执行用户Timer回调
-
-**Event Manager线程生命周期**：
-```c
-// 1. 内核分配临时线程
-kevent_workq_internal() → workq_kevent_callback() 
-→ _pthread_wqthread() // 带WQ_FLAG_THREAD_KEVENT标志
-
-// 2. 线程类型判断和任务执行
-_dispatch_kevent_worker_thread() {
-    bool is_manager = _dispatch_wlh_worker_thread_init(&ddi);
-    if (is_manager) {
-        _dispatch_event_loop_drain_anon_timers();   // 检查timer heap
-        _dispatch_wlh_worker_thread_reset();        // 归还线程
-    }
-}
-
-// 3. Timer检测和派发
-_dispatch_timers_run() {
-    while ((dr = dth[tidx].dth_min[DTH_TARGET_ID])) {
-        if (dr->dt_timer.target > now) break;  // 未到期
-        
-        // 找到到期Timer，触发第二次wakeup
-        dux_merge_evt(dr, flags, data, 0);
-    }
-}
-```
-
-**完整执行路径**：
-```c
-_dispatch_queue_wakeup(ds, qos, flags, DISPATCH_QUEUE_WAKEUP_TARGET);
+_dispatch_queue_wakeup(ds, qos, flags, DISPATCH_QUEUE_WAKEUP_TARGET)
   ↓
-_dispatch_lane_wakeup() // 普通队列处理
+_dispatch_lane_wakeup()  // 普通队列处理
   ↓
-// 更新队列状态，增加pending工作项
+// 原子更新队列状态，增加pending工作项
 os_atomic_rmw_loop2o(dq, dq_state, old_state, new_state, relaxed, {
     new_state = old_state + DISPATCH_QUEUE_WIDTH_INTERVAL | DISPATCH_QUEUE_DIRTY;
 });
   ↓
 // 请求pthread workqueue分配Worker线程
 _dispatch_root_queue_poke() → _pthread_workqueue_addthreads()
-  ↓
+```
+
+#### Worker线程执行用户回调
+
+```c
 // 内核分配线程并调用注册回调
 _dispatch_worker_thread2(pthread_priority_t pp)
   ↓
 // 获取对应root queue并开始处理
 _dispatch_root_queue_drain() → _dispatch_source_invoke()
   ↓
-// 执行用户Timer回调
-handler(); // 用户的Timer回调代码
+// 最终执行用户Timer回调
+dispatch_source_get_handle(source);  // 获取Timer句柄
+unsigned long data = dispatch_source_get_data(source);  // 获取触发次数
+handler();  // 执行用户的Timer回调代码
 ```
 
-### 两次调用对比
+#### Timer数据获取机制
 
-| 维度 | 第一次 (激活) | 第二次 (回调) |
-|------|--------------|--------------|
-| **判断条件** | `!ds->ds_is_installed` | `ds_pending_data != 0` |
-| **目标队列** | 管理队列 | Timer的目标队列 |
-| **线程类型** | Event Manager线程 | 普通Worker线程 |
-| **主要任务** | 系统注册和配置 | 用户回调执行 |
-| **生命周期** | 立即处理后归还 | 临时分配执行后归还 |
-
-## 完整触发链路
-
-```
-1. 用户代码调用dispatch_resume()
-   └── Timer立即注册到全局heap和内核kqueue
-
-2. 内核kqueue检测EVFILT_TIMER到期
-   └── kevent_workq_internal()投递事件到pthread workqueue
-
-3. pthread workqueue分配Event Manager线程
-   └── _pthread_wqthread()带_PTHREAD_PRIORITY_EVENT_MANAGER_FLAG
-
-4. Event Manager线程处理kevent事件
-   ├── _dispatch_kevent_worker_thread()线程入口
-   ├── _dispatch_event_loop_drain_anon_timers()检查timer heap
-   └── _dispatch_timers_run()找到实际到期的timer
-
-5. 异步派发timer回调到目标队列
-   ├── _dispatch_source_merge_evt()设置pending数据
-   └── dx_wakeup()唤醒目标队列
-
-6. pthread workqueue分配Worker线程执行回调
-   └── 在目标队列QoS上下文中执行用户Timer回调
-
-7. Event Manager线程归还
-   └── _dispatch_wlh_worker_thread_reset()清理状态并返回线程池
+```c
+// 用户回调中获取Timer触发信息
+DISPATCH_ALWAYS_INLINE
+static inline unsigned long _dispatch_source_timer_data(dispatch_timer_source_refs_t dr, uint64_t prev)
+{
+    unsigned long data = (unsigned long)prev >> 1;
+    
+    // 与_dispatch_timers_run()的release barrier配对，确保内存可见性
+    uint64_t now = os_atomic_load2o(dr, ds_pending_data, acquire);
+    if ((now & DISPATCH_TIMER_DISARMED_MARKER) && data) {
+        data = (unsigned long)now >> 1;
+    }
+    
+    return data;  // 返回Timer触发次数（1=正常触发，2=取消触发）
+}
 ```
