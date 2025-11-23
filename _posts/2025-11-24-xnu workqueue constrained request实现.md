@@ -340,60 +340,7 @@ if (tr_flags & (WORKQ_TR_FLAG_KEVENT | WORKQ_TR_FLAG_WORKLOOP)) {
 
 **注意**: tr_count == 1的请求（场景2和3）是最小单元请求，它们的enqueue/dequeue直接影响系统调度性能。
 
-## 完整数据流对比
-
-### 场景对比表
-
-| 场景 | 触发时机 | 调用路径 | enqueue/dequeue | 特点 |
-|------|----------|----------|----------------|------|
-| **场景1: dispatch_async** | 用户提交work | workq_reqthreads → enqueue | **enqueue** | 最常用，需creator分配线程 |
-| **场景2a: kevent rebind** | 线程即将unbind时收到新请求 | workq_kern_threadreq_initiate → 直接绑定 | **无enqueue** | 避免上下文切换，直接复用线程 |
-| **场景2b: kevent创建** | 首次创建kevent/workloop | workq_kern_threadreq_initiate → enqueue | **enqueue** | 创建持久化请求队列 |
-| **场景3: modify QoS** | 修改请求参数 | workq_kern_threadreq_modify → dequeue → enqueue | **dequeue+enqueue** | 改变优先级，动态重排序 |
-| **线程完成工作** | 线程返回内核 | workq_thread_return → select → dequeue | **dequeue** | 循环核心，实时绑定请求 |
-
-### 关键时序图
-
-```mermaid
-sequenceDiagram
-    participant U as 用户线程
-    participant K as 内核
-    participant W as Workqueue
-    participant T as 线程
-
-    Note over U,T: 场景1: dispatch_async
-    U->>K: WQOPS_QUEUE_REQTHREADS
-    K->>W: enqueue(请求)
-    W->>T: creator唤醒或创建线程
-    T->>U: 执行work
-
-    Note over U,T: 场景2a: kevent rebind
-    T->>K: 即将unbind
-    K->>K: 收到新kevent
-    K->>K: 直接绑定到当前线程
-    Note over T: 不需要unbind/rebind
-
-    Note over U,T: 场景3: modify QoS
-    K->>W: dequeue(旧请求)
-    K->>K: 修改QoS
-    K->>W: enqueue(新请求)
-    W->>T: 按新优先级调度
-
-    Note over T: 线程完成工作
-    T->>K: WQOPS_THREAD_RETURN
-    K->>W: select新请求
-    K->>W: dequeue(绑定到T)
-    K->>W: 有新请求
-    T->>U: 执行新work
-    K->>W: 无新请求
-    T->>T: park等待唤醒
-```
-
-**核心理解**:
-1. **enqueue有3种场景**：新work、kevent创建、modify重排序
-2. **dequeue有2种用途**：modify时重排、绑定时获取请求
-3. **Rebind优化**：避免不必要的unbind/rebind上下文切换
-4. **实时绑定**：线程完成工作时立即dequeue并绑定，减少延迟
+---
 
 ## 二、constrained队列的请求选择
 
