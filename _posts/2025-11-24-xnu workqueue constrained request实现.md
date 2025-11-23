@@ -379,9 +379,10 @@ sequenceDiagram
 
 **核心理解**:
 1. **enqueue有3种场景**：新work、kevent创建、modify重排序
-2. **dequeue有2种用途**：modify时重排、绑定时获取请求
-3. **Rebind优化**：避免不必要的unbind/rebind上下文切换
-4. **实时绑定**：线程完成工作时立即dequeue并绑定，减少延迟
+2. **dequeue只有1种用途**：绑定时获取请求（通过准入检查后）
+3. **Modify中的"dequeue"**：从priority_queue移除请求，与workq_threadreq_dequeue()函数无关
+4. **Rebind优化**：避免不必要的unbind/rebind上下文切换
+5. **实时绑定**：线程完成工作时立即dequeue并绑定，减少延迟
 
 ---
 
@@ -1514,10 +1515,220 @@ park_thawed:
 | 8 | `kqueue_threadreq_bind_prepost()` | 预绑定kevent/workloop请求 |
 | 9 | `workq_setup_and_run()` | 准备并运行用户代码 |
 
-**抢占检查**:
-如果调度器检测到当前线程应该被高优先级任务抢占，`thread_unfreeze_base_pri()`会返回true，此时需要：
-1. 将turnstile继承者返还给workqueue
-2. park而不是运行用户代码
+**真正触发绑定（workq_threadreq_dequeue）的时刻**：
+
+| 状态转换 | 触发时机 | 进入路径 | 是否绑定 |
+|----------|----------|----------|----------|
+| **idle → 唤醒** | 线程被creator弹出并唤醒 | `workq_unpark_continue()` → `workq_select_threadreq_or_park_and_unlock()` | ✅ 可能绑定（如果选择到请求且通过准入检查） |
+| **running → 完成工作** | 线程执行完用户代码，返回内核 | `workq_thread_return()` → `workq_select_threadreq_or_park_and_unlock()` | ✅ 可能绑定 |
+| **creator → 执行** | creator被唤醒后执行，选择请求 | `workq_select_threadreq_or_park_and_unlock()`（is_creator=true） | ✅ 可能绑定（creator转化为worker） |
+
+**不会触发绑定的情况**：
+- ❌ **dispatch_async提交** - 只是enqueue请求，不dequeue
+- ❌ **线程执行中block** - block时不进入选择流程，只有完成时才进入
+- ❌ **线程idle状态** - idle时不会进入选择流程，只有被唤醒时才进入
+- ❌ **modify请求** - 是从priority_queue移除，不调用workq_threadreq_dequeue
+
+### 4.4 线程被唤醒的触发条件与外部表现
+
+**从外部视角看**，开发者最关心的是：**什么时候线程会被唤醒？**
+
+### 4.4.1 外部触发条件总结
+
+| 外部操作/事件 | 是否触发线程唤醒 | 说明 |
+|---------------|------------------|------|
+| **dispatch_async(queue, block)** | ❌ **不会** | 只是提交请求到队列，不直接唤醒线程 |
+| **dispatch_sync(queue, block)** | ✅ **可能** | 同步提交，可能导致线程唤醒以保持FIFO语义 |
+| **kevent触发** | ✅ **会** | 内核事件触发时唤醒绑定的kevent线程 |
+| **workloop执行完成** | ❌ **不会** | workloop是持续执行的，不会"唤醒" |
+| **creator被选中执行** | ✅ **会** | creator自己会被唤醒执行调度任务 |
+| **creator分配新任务** | ✅ **会** | 从idle列表弹出work线程并唤醒 |
+| **线程创建完成** | ✅ **会** | 新线程创建后自动开始执行 |
+
+### 4.4.2 核心触发条件详解
+
+#### 触发条件1: creator被唤醒执行
+
+**这是最常见的触发条件**：
+
+**外部表现**：
+```
+用户提交了dispatch_async，但队列中已有idle线程：
+    ↓ creator被唤醒（turnstile机制）
+    ↓ creator从idle列表弹出线程
+    ↓ 唤醒该idle线程
+    ↓ 线程执行用户代码
+```
+
+**源码路径**：
+```c
+// 用户提交请求
+dispatch_async(queue, block)
+    ↓
+// 内核检查需要creator
+workq_schedule_creator(p, wq, flags)
+    ↓
+// creator被唤醒（turnstile通知）
+workq_unpark_continue()
+    ↓
+// creator选择请求并唤醒线程
+workq_thread_wakeup(uth)
+    ↓
+// 线程被唤醒
+workq_unpark_continue()
+    ↓
+// 线程选择请求并执行
+workq_threadreq_dequeue()
+```
+
+#### 触发条件2: creator分配新任务时唤醒
+
+**当creator决定让idle线程执行任务时**：
+
+**源码位置**：
+```c
+// pthread_workqueue.c:3002-3011
+while (unpaced > 0 && wq->wq_thidlecount) {
+    struct uthread *uth;
+    bool needs_wakeup;
+
+    uth = workq_pop_idle_thread(wq, uu_flags, &needs_wakeup);
+    _wq_thactive_inc(wq, qos);
+    wq->wq_thscheduled_count[_wq_bucket(qos)]++;
+    workq_thread_reset_pri(wq, uth, req, /*unpark*/ true);
+    wq->wq_fulfilled++;
+
+    uth->uu_save.uus_workq_park_data.upcall_flags = upcall_flags;
+    uth->uu_save.uus_workq_park_data.thread_request = req;
+    if (needs_wakeup) {
+        workq_thread_wakeup(uth);  // 👈 唤醒idle线程
+    }
+}
+```
+
+**外部表现**：
+```
+系统检测到有未处理请求，且有idle线程可用：
+    ↓ creator从idle列表弹出线程
+    ↓ 唤醒该线程
+    ↓ 线程执行绑定请求
+```
+
+### 4.4.3 唤醒的内部机制
+
+**核心函数**: `workq_thread_wakeup()` - pthread_workqueue.c:1167
+
+```c
+static inline void workq_thread_wakeup(struct uthread *uth)
+{
+    thread_t th = get_machthread(uth);
+    assert(uth->uu_workq_flags & UT_WORKQ_IDLE);
+    uth->uu_workq_flags &= ~UT_WORKQ_IDLE;      // 清除idle标志
+    thread_unblock(th, THREAD_UNBLOCK);         // 唤醒线程
+}
+```
+
+**唤醒的本质**：
+- **不是创建新线程** - 线程已经存在（从idle列表弹出）
+- **不是立即开始执行** - 可能被其他高优先级任务抢占
+- **是状态转换** - 从idle状态进入可调度状态
+
+### 4.4.4 关键概念区分：park vs block vs busy vs wakeup
+
+| 概念 | 含义 | 状态转换 | 触发时机 | 计数变量 |
+|------|------|----------|----------|----------|
+| **park（停车）** | 线程主动进入idle状态，等待分配任务 | running → idle | 线程完成工作但无新请求时 | `wq_thidlecount++` |
+| **idle（空闲）** | 线程处于空闲状态，等待creator唤醒 | idle → running | creator调用workq_thread_wakeup() | `wq_thidlecount--` |
+| **block（阻塞）** | 线程在执行用户代码时因I/O等被阻塞 | running → waiting | 用户代码调用sleep、read等时 | `wq_lastblocked_ts`记录时间戳 |
+| **busy（忙）** | 最近被阻塞的线程（200μs内），可能很快恢复 | - | 线程block后短时间内 | `busycount`统计 |
+
+**重要区分**：
+- **park是调度管理**：线程处于空闲状态，等待creator分配任务
+- **block是执行阻塞**：线程在执行用户代码时被外部事件阻塞
+- **busy是阻塞记录**：记录最近被阻塞的线程，用于预留槽位
+- **wakeup是状态转换**：从idle变为可执行
+
+**线程状态完整模型**：
+```
+idle（空闲） ←——park()—— running（活跃） ——block()——> waiting（阻塞）
+   ↑                    ↓                              ↓
+wakeup()          执行用户代码                    I/O完成/计时器
+   ↓                    ↓                              ↓
+running（活跃） ←——选择请求—— waiting（阻塞） ——unblock()——
+```
+
+**示例场景**：
+```
+场景1: 线程完成工作
+    线程执行完block → 调用park() → 进入idle状态
+
+场景2: 用户代码阻塞
+    线程执行read(fd, buf, size) → 线程block → 等待I/O完成
+    I/O完成后unblock → 线程重新可调度
+
+场景3: block记录
+    线程block → 记录block时间戳到wq_lastblocked_ts
+    200μs内视为"busy" → 用于准入检查预留槽位
+
+场景4: 唤醒线程
+    creator调用workq_thread_wakeup() → idle线程变为running → 进入选择流程
+```
+
+### 4.4.5 唤醒后的执行流程
+
+**线程被唤醒后会立即进入选择流程**：
+
+```mermaid
+sequenceDiagram
+    participant C as Creator
+    participant K as 内核
+    participant T as 线程
+
+    Note over C,T: T线程处于idle状态（已park）
+    C->>K: workq_thread_wakeup(T)  // 👈 外部触发：creator唤醒线程
+    K->>K: 清除idle标志
+    K->>K: thread_unblock(T)
+
+    Note over T: T被唤醒！
+    T->>K: workq_unpark_continue()  // 👈 唤醒后的入口函数
+    K->>K: workq_select_threadreq_or_park_and_unlock()
+    K->>K: 选择请求
+
+    alt 选择到请求
+        K->>K: 通过准入检查
+        K->>K: workq_threadreq_dequeue()  // 绑定请求
+        K->>T: 返回用户空间执行
+        T->>T: 执行dispatch_async的block
+    else 未选择到请求
+        K->>T: park继续等待
+    end
+```
+
+**关键点**：线程被唤醒后**一定会**进入`workq_select_threadreq_or_park_and_unlock()`，这是唤醒后的标准流程。
+
+### 4.4.5 外部视角如何观察线程被唤醒
+
+从应用开发者角度，无法直接观察到"线程被唤醒"，但可以通过以下间接方式推断：
+
+| 现象 | 推断 |
+|------|------|
+| dispatch_async提交后，block立即开始执行 | 可能有idle线程被唤醒 |
+| dispatch_async提交后，block过一会儿才开始执行 | 触发创建新线程或creator调度 |
+| kevent事件触发后，kevent处理函数立即执行 | kevent线程被唤醒 |
+
+### 4.4.6 总结：唤醒的核心逻辑
+
+**触发条件**：
+1. ✅ **creator被选中执行** - turnstile机制通知
+2. ✅ **creator分配任务** - 弹出idle线程并唤醒
+3. ✅ **kevent触发** - 事件驱动唤醒
+
+**不在**：
+- ❌ **dispatch_async提交** - 只进入队列，不直接唤醒线程
+- ❌ **线程执行中** - already running，不需要唤醒
+- ❌ **线程block** - block是主动行为，唤醒是外部触发
+
+**结果**：线程被唤醒后立即进入选择流程，可能绑定请求并开始执行用户代码。
 
 ---
 
