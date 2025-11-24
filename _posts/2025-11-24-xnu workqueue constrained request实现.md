@@ -384,6 +384,49 @@ sequenceDiagram
 4. **Rebind优化**：避免不必要的unbind/rebind上下文切换
 5. **实时绑定**：线程完成工作时立即dequeue并绑定，减少延迟
 
+## 出队、计数与休眠/唤醒/新增的先后顺序
+
+### 请求出队的完整场景
+- 线程返回内核：`workq_thread_return → workq_select_threadreq_or_park_and_unlock`，准入通过后在此调用`workq_threadreq_dequeue()`（`reqcount--`，从PQ/STAILQ移除）。
+- creator唤醒：`workq_schedule_creator`（调用者线程） → 唤醒creator → `workq_unpark_continue → workq_select_threadreq_or_park_and_unlock`（creator线程），同样在选择时dequeue。
+- modify/cancel：`workq_kern_threadreq_modify`或`workq_threadreq_destroy`直接`priority_queue_remove`/`STAILQ_REMOVE_HEAD`做重排或销毁，不经过`workq_threadreq_dequeue()`。
+- unpaced早绑定：`workq_reqthreads`循环直接把请求塞给idle线程（`UT_WORKQ_EARLY_BOUND`），`reqcount`已扣减，唤醒后直接执行，不会再从队列dequeue。
+
+### 计数更新的关键位置
+- **活跃/调度计数增加**
+  - creator转worker：`workq_select_threadreq_or_park_and_unlock`里`is_creator`分支执行`_wq_thactive_inc + wq_thscheduled_count++`。
+  - 运行线程换QoS：同函数里`_wq_thactive_move()`。
+  - unpaced早绑定：`workq_reqthreads`循环里`_wq_thactive_inc + wq_thscheduled_count++`。
+- **活跃/调度计数减少**
+  - worker回idle：`workq_push_idle_thread`中`_wq_thactive_dec`（非creator）和`wq_thscheduled_count--`。
+- **idle计数**
+  - 减少：`workq_pop_idle_thread`弹出idle线程或`workq_unpark_for_death_and_unlock`用于杀线程。
+  - 增加：`workq_add_new_idle_thread`创建成功入`thnewlist`，以及`workq_push_idle_thread`把运行线程放回idle列表。
+- **新增线程顺序**
+  - `workq_add_new_idle_thread`先`wq_nthreads++`后释放锁→创建线程→成功则`wq_thidlecount++`并入`thnewlist`；失败回滚`wq_nthreads--`。
+
+### 时序总览（mermaid）
+```mermaid
+flowchart TD
+    R[新请求生成] --> P{workq_reqthreads并行分发?}
+    P -->|是| EB[workq_pop_idle_thread<br/>idle--, scheduled++/active++<br/>UT_WORKQ_EARLY_BOUND]
+    EB --> EBRun[唤醒后直接执行<br/>(不经过dequeue)]
+    P -->|否| ENQ[workq_threadreq_enqueue<br/>reqcount++]
+
+    ENQ --> CR{creator可用?}
+    CR -->|有idle| POPC[workq_pop_idle_thread<br/>idle--, scheduled++]
+    POPC --> SEL[workq_select_threadreq_or_park_and_unlock<br/>creator->active++ & scheduled++]
+    CR -->|无idle| NEW[workq_add_new_idle_thread<br/>nthreads++, idle++]
+    NEW --> SEL
+
+    SEL --> DQ[workq_threadreq_dequeue<br/>reqcount-- (PQ移除)]
+    DQ --> RUN[workq_setup_and_run 执行用户work]
+    RUN --> IDLE[workq_thread_return → workq_push_idle_thread<br/>scheduled--, active--, idle++]
+    IDLE --> KILL{闲置过多?}
+    KILL -->|是| DIE[workq_unpark_for_death_and_unlock<br/>nthreads--]
+    KILL -->|否| PARK[线程park等待唤醒]
+```
+
 ---
 
 ## 二、constrained队列的请求选择
